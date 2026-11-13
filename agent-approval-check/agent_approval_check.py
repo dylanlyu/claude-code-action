@@ -34,7 +34,9 @@ AGENT DETECTION:
 
 APPROVAL COUNTING:
     Valid approvals come from non-agent users with write access to the
-    repository (verified via the collaborators permission API), via either:
+    repository (verified via the collaborators permission API; GitHub
+    authorAssociation is not used, because a repository-scoped token reports
+    NONE for org members whose membership is private), via either:
     - A non-dismissed APPROVED review (staleness is controlled by GitHub's
       branch protection dismiss_stale_reviews setting)
     - A /approve <sha> comment
@@ -102,12 +104,13 @@ logger = logging.getLogger(__name__)
 CHECK_NAME = "agent-approval-check"
 REQUIRED_APPROVALS = int(os.environ.get("REQUIRED_APPROVALS") or 2)
 
-# Only approvals from users with write access to the repo count. authorAssociation
-# alone can't prove that (a MEMBER or COLLABORATOR may have read/triage only), so
-# it's used as a cheap pre-filter and the actual gate is a per-user REST
-# `GET /repos/{o}/{r}/collaborators/{login}/permission` check. A login outside
-# this set is not a collaborator at all, so the REST call is skipped.
-WRITE_ACCESS_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+# Only approvals from users with write access to the repo count. The only gate
+# is a per-user REST `GET /repos/{o}/{r}/collaborators/{login}/permission`
+# check. authorAssociation can't serve as a pre-filter in either direction: a
+# MEMBER may have read/triage only, and a repository-scoped token reports NONE
+# (or CONTRIBUTOR) for write-authorized org members whose membership is
+# private (#1700). Cheap local checks run first so the REST call is reserved
+# for real candidates, and results are cached per login.
 WRITE_PERMISSION_LEVELS = frozenset({"write", "push", "maintain", "admin"})
 DOCS_URL = (
     os.environ.get("DOCS_URL")
@@ -187,7 +190,6 @@ query GetPRData($owner: String!, $repo: String!, $prNumber: Int!) {
             __typename
             login
           }
-          authorAssociation
           state
           commit {
             oid
@@ -206,7 +208,6 @@ query GetPRData($owner: String!, $repo: String!, $prNumber: Int!) {
             __typename
             login
           }
-          authorAssociation
           body
           isMinimized
         }
@@ -240,7 +241,6 @@ query GetPRComments($owner: String!, $repo: String!, $prNumber: Int!, $before: S
             __typename
             login
           }
-          authorAssociation
           body
           isMinimized
         }
@@ -671,16 +671,18 @@ def iter_approve_commands(
         commenter = comment.get("user", {}).get("login", "")
         if not commenter:  # Skip deleted users or null authors
             continue
-        if comment.get("author_association") not in WRITE_ACCESS_ASSOCIATIONS:
-            continue
-        if is_agent_user(commenter, config):
-            continue
-        if is_excluded_approver(commenter, config):
-            continue
+        # Parse first: most comments aren't /approve and shouldn't be logged.
         approved_sha = parse_approve_command(comment.get("body", ""))
         if not approved_sha:
             continue
+        if is_agent_user(commenter, config):
+            logger.info("Ignoring /approve from %s: agent identity", commenter)
+            continue
+        if is_excluded_approver(commenter, config):
+            logger.info("Ignoring /approve from %s: excluded approver", commenter)
+            continue
         if not permission_check(commenter):
+            logger.info("Ignoring /approve from %s: no write permission", commenter)
             continue
         yield ApproveCommand(
             commenter=commenter,
@@ -946,15 +948,15 @@ def count_approvers(
     # GitHub's branch protection settings (dismiss_stale_reviews_on_push)
     # control which reviews remain active — we defer to that.
     for login, review in get_latest_review_per_user(reviews).items():
-        if review.get("author_association") not in WRITE_ACCESS_ASSOCIATIONS:
+        if review.get("state") != "APPROVED":
             continue
         if is_agent_user(login, config):
             continue
         if is_excluded_approver(login, config):
-            continue
-        if review.get("state") != "APPROVED":
+            logger.info("Ignoring APPROVE from %s: excluded approver", login)
             continue
         if not permission_check(login):
+            logger.info("Ignoring APPROVE from %s: no write permission", login)
             continue
         logger.info("Counting APPROVE from %s", login)
         approvers.add(login.lower())
@@ -1324,7 +1326,6 @@ class GitHubClient:
         reviews = [
             {
                 "user": {"login": normalize_graphql_login(node.get("author"))},
-                "author_association": node.get("authorAssociation", ""),
                 "state": node.get("state", ""),
                 "commit_id": (node.get("commit") or {}).get("oid", ""),
                 "submitted_at": node.get("submittedAt", ""),
@@ -1337,7 +1338,6 @@ class GitHubClient:
                 "id": node.get("databaseId", 0),
                 "node_id": node.get("id", ""),
                 "user": {"login": normalize_graphql_login(node.get("author"))},
-                "author_association": node.get("authorAssociation", ""),
                 "body": node.get("body", ""),
                 "is_minimized": node.get("isMinimized", False),
             }

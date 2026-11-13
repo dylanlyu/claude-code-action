@@ -23,6 +23,22 @@ jobs:
       - name: Run tests
         run: bun test
 
+  agent-approval-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install httpx pyyaml tenacity
+
+      - name: Run agent-approval-check tests
+        working-directory: agent-approval-check
+        run: python -m unittest discover -s . -p 'test_*.py' -v
+
   prettier:
     runs-on: ubuntu-latest
     steps:
